@@ -23,6 +23,8 @@ import PIL
 from PIL import Image
 from PIL import ImageFilter
 from PIL import ImageOps
+import csv
+from torch.utils.data import Dataset
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -68,6 +70,23 @@ def init_data(
 
     if dataset_name == 'imagenet':
         return _init_imgnt_data(
+            transform=transform,
+            init_transform=init_transform,
+            u_batch_size=u_batch_size,
+            s_batch_size=s_batch_size,
+            classes_per_batch=classes_per_batch,
+            unique_classes=unique_classes,
+            multicrop_transform=multicrop_transform,
+            supervised_views=supervised_views,
+            world_size=world_size,
+            rank=rank,
+            root_path=root_path,
+            image_folder=image_folder,
+            training=training,
+            copy_data=copy_data)
+
+    elif dataset_name == 'ROV':
+        return _init_ROV_data(
             transform=transform,
             init_transform=init_transform,
             u_batch_size=u_batch_size,
@@ -399,6 +418,86 @@ def _init_imgnt_data(
             supervised_loader, supervised_sampler)
 
 
+def _init_ROV_data(
+    transform,
+    init_transform,
+    u_batch_size,
+    s_batch_size,
+    classes_per_batch,
+    unique_classes=False,
+    multicrop_transform=(0, None),
+    supervised_views=1,
+    world_size=1,
+    rank=0,
+    root_path='/datasets/',
+    image_folder='imagenet_full_size/061417/',
+    training=True,
+    copy_data=False,
+    tar_folder='imagenet_full_size/',
+    tar_file='imagenet_full_size-061417.tar'
+):
+    unsupervised_set = ROVDataset(
+        root=root_path,
+        image_folder=image_folder,
+        transform=transform,
+        train=training,
+        supervised=False,
+        init_transform=init_transform,
+        multicrop_transform=multicrop_transform,
+        seed=_GLOBAL_SEED)
+
+    unsupervised_sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset=unsupervised_set,
+        num_replicas=world_size,
+        rank=rank)
+    unsupervised_loader = torch.utils.data.DataLoader(
+        unsupervised_set,
+        sampler=unsupervised_sampler,
+        batch_size=u_batch_size,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=8)
+    logger.info('ROV unsupervised data loader created')
+
+    supervised_sampler, supervised_loader = None, None
+    if classes_per_batch > 0 and s_batch_size > 0:
+        logger.info('Making supervised ROV data loader...')
+        supervised_set = ROVDataset(
+            root=root_path,
+            image_folder=image_folder,
+            transform=transform,
+            train=training,
+            supervised=True,
+            supervised_views=supervised_views,
+            init_transform=init_transform,
+            seed=_GLOBAL_SEED
+            )
+        supervised_sampler = ClassStratifiedSampler(
+            data_source=supervised_set,
+            world_size=world_size,
+            rank=rank,
+            batch_size=s_batch_size,
+            classes_per_batch=classes_per_batch,
+            unique_classes=unique_classes,
+            seed=_GLOBAL_SEED)
+        supervised_loader = torch.utils.data.DataLoader(
+            supervised_set,
+            batch_sampler=supervised_sampler,
+            pin_memory=True,
+            num_workers=8)
+        if len(supervised_loader) > 0:
+            tmp = ceil(len(unsupervised_loader) / len(supervised_loader))
+            supervised_sampler.set_inner_epochs(tmp)
+            logger.info(f'supervised-reset-period {tmp}')
+        logger.info('ROV supervised data loader created')
+
+    return (unsupervised_loader, unsupervised_sampler,
+            supervised_loader, supervised_sampler)
+
+
+
+
+
 def make_transforms(
     dataset_name,
     subset_path=None,
@@ -444,6 +543,27 @@ def make_transforms(
             scale=crop_scale,
             keep_file=keep_file)
 
+    elif 'ROV' in dataset_name:
+        logger.info('making ROV data transforms')
+
+        # -- file identifying which imagenet labels to keep
+        keep_file = None
+        if subset_path is not None:
+            if unlabeled_frac >= 0:
+                keep_file = os.path.join(subset_path, '10_percent_train_with_unknown_balanced.csv')
+            logger.info(f'keep file: {keep_file}')
+
+        return _make_ROV_transforms(
+            unlabel_prob=unlabeled_frac,
+            training=training,
+            basic=basic_augmentations,
+            force_center_crop=force_center_crop,
+            normalize=normalize,
+            color_distortion=color_jitter,
+            scale=crop_scale,
+            keep_file=keep_file)
+
+
     elif 'cifar10' in dataset_name:
         logger.info('making cifar10 data transforms')
         keep_file = None
@@ -461,6 +581,7 @@ def make_transforms(
             scale=crop_scale,
             color_distortion=color_jitter,
             keep_file=keep_file)
+
 
 
 def _make_cifar10_transforms(
@@ -630,6 +751,102 @@ def _make_imgnt_transforms(
     return transform, init_transform
 
 
+def _make_ROV_transforms(
+    unlabel_prob,
+    training=True,
+    basic=False,
+    force_center_crop=False,
+    normalize=False,
+    scale=(0.08, 1.0),
+    color_distortion=1.0,
+    keep_file=None
+):
+    """
+    Make data transformations
+
+    :param unlabel_prob: probability of sampling unlabeled data point
+    :param training: generate data transforms for train (alternativly test)
+    :param basic: whether train transforms include more sofisticated transforms
+    :param force_center_crop: whether to override settings and apply center crop to image
+    :param normalize: whether to normalize image means and stds
+    :param scale: random scaling range for image before resizing
+    :param color_distortion: strength of color distortion
+    :param keep_file: file containing names of images to use for semisupervised
+    """
+    def get_color_distortion(s=1.0):
+        # s is the strength of color distortion.
+        color_jitter = transforms.ColorJitter(0.8*s, 0.8*s, 0.8*s, 0.2*s)
+        rnd_color_jitter = transforms.RandomApply([color_jitter], p=0.8)
+        rnd_gray = transforms.RandomGrayscale(p=0.2)
+        color_distort = transforms.Compose([
+            rnd_color_jitter,
+            rnd_gray])
+        return color_distort
+
+    logger.debug(f'uprob: {unlabel_prob}\t training: {training}\t basic: {basic}\t normalize: {normalize}\t color_distortion: {color_distortion}')
+    if training and (not force_center_crop):
+        if basic:
+            transform = transforms.Compose(
+                [transforms.RandomResizedCrop(size=224, scale=scale),
+                 transforms.RandomHorizontalFlip(),
+                 transforms.ToTensor()])
+        else:
+            logger.debug('making training (non-basic) transforms')
+            transform = transforms.Compose(
+                [transforms.RandomResizedCrop(size=224, scale=scale),
+                 transforms.RandomHorizontalFlip(),
+                 get_color_distortion(s=color_distortion),
+                 GaussianBlur(p=0.5),
+                 transforms.ToTensor()])
+    else:
+        transform = transforms.Compose(
+            [transforms.Resize(size=256),
+             transforms.CenterCrop(size=224),
+             transforms.ToTensor()])
+
+    if normalize:
+        transform = transforms.Compose(
+            [transform,
+             transforms.Normalize(
+                 (0.485, 0.456, 0.406),
+                 (0.229, 0.224, 0.225))])
+
+    def init_transform(samples, seed,
+                       keep_file=keep_file,
+                       training=training):
+        """ Transforms applied to dataset at the start of training """
+
+        new_targets, new_samples = [], []
+        if training and (keep_file is not None) and os.path.exists(keep_file):
+            logger.info(f'Using {keep_file}')
+            with open(keep_file, 'r') as rfile:
+                lines = csv.reader(rfile)
+                for line in lines:
+                    #class_name = line.split('_')[0]
+                    target = line[1]
+                    img = line[0]
+                    new_samples.append(
+                        (img,
+                         target))
+                    new_targets.append(target)
+        else:
+            logger.info('flipping coin to keep labels')
+            g = torch.Generator()
+            g.manual_seed(seed)
+            for sample in samples:
+                if torch.bernoulli(torch.tensor(unlabel_prob), generator=g) == 0:
+                    target = sample[1]
+                    new_samples.append((sample[0], target))
+                    new_targets.append(target)
+
+        return np.array(new_targets), np.array(new_samples)
+
+    return transform, init_transform
+
+
+
+
+
 def make_multicrop_transform(
     dataset_name,
     num_crops,
@@ -638,7 +855,7 @@ def make_multicrop_transform(
     normalize,
     color_distortion
 ):
-    if 'imagenet' in dataset_name:
+    if 'imagenet' or 'ROV' in dataset_name:
         return _make_multicrop_imgnt_transforms(
             num_crops=num_crops,
             size=size,
@@ -986,6 +1203,123 @@ class TransImageNet(ImageNet):
                 return img_1, img_2, target
 
         return img, target
+
+
+class ROVDataset(Dataset):
+
+    def __init__(self,
+        root,
+        image_folder,
+        transform,
+        train,
+        supervised=False,
+        supervised_views=1,
+        init_transform=None,
+        multicrop_transform=(0, None),
+        seed=0):
+        '''
+            This needs self.targets, self.samples. Apply the transform given in args. If supervised=False, read unlabeled data. If supervised=True and train=False, use val data.
+        '''
+        self.supervised = supervised
+        self.supervised_views = supervised_views
+        self.multicrop_transform = multicrop_transform
+        self.transform = transform
+
+        
+        # index data into list
+        self.samples = [] ## I think self.samples is a tuple of (label,img). Check this.
+        self.targets = []
+
+        self.label_mapping = {}
+        global_mapping_idx = 0
+
+        if train and supervised:
+            f = open('/home/tsharma/tarun_code/suncet/ROV_subsets/10_percent_train_with_unknown_balanced.csv', 'r')
+            csv_reader = csv.reader(f, delimiter=',')
+            for row in csv_reader:
+                self.samples.append([row[0], int(row[1])])
+                self.targets.append(int(row[1]))
+            f.close()
+                
+        elif supervised and not train:
+            #### val
+            f = open('/home/tsharma/tarun_code/suncet/ROV_subsets/10_percent_train_with_unknown_balanced.csv', 'r') ### -> replace this by the val file (also balanced i guess)
+            csv_reader = csv.reader(f, delimiter=',')
+            for row in csv_reader:
+                self.samples.append([row[0], int(row[1])])
+                self.targets.append(int(row[1]))
+            f.close()
+            
+        elif not supervised:
+            #### unlabeled
+            f = open('/home/tsharma/tarun_code/75_percent_unlabeled_with_unknown.csv','r')
+            csv_reader = csv.reader(f, delimiter=',')
+            for row in csv_reader:
+                self.samples.append([row[0], 999])  ## -> added dummy number 999 so as to not change structure of code       
+                self.targets.append(999)
+            f.close()
+
+
+        self.classes = np.unique(np.array(self.targets))
+
+        if self.supervised:
+            self.targets, self.samples = init_transform(
+                self.samples,
+                seed)
+            logger.debug(f'num-labeled {len(self.samples)}')
+            mint = None
+            self.target_indices = []
+
+            for t in range(len(self.classes)):
+                indices = np.squeeze(np.argwhere(
+                    self.targets == t)).tolist()
+                self.target_indices.append(indices)
+                mint = len(indices) if mint is None else min(mint, len(indices))
+                logger.debug(f'num-labeled target {t} {len(indices)}')
+            logger.debug(f'min. labeled indices {mint}')
+
+
+                
+    @property
+    def classes(self):
+        return self.classes
+
+                
+    def __len__(self):
+        '''
+            Returns the length of the dataset.
+        '''
+        return len(self.samples)
+
+    
+    def __getitem__(self, index):
+        
+        target = self.targets[index]
+        path = self.samples[index][0]
+        img = Image.open(image_path).convert('RGB')
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        if self.transform is not None:
+            if self.supervised:
+                return *[self.transform(img) for _ in range(self.supervised_views)], target
+            else:
+                img_1 = self.transform(img)
+                img_2 = self.transform(img)
+
+                multicrop, mc_transform = self.multicrop_transform
+                if multicrop > 0 and mc_transform is not None:
+                    mc_imgs = [mc_transform(img) for _ in range(int(multicrop))]
+                    return img_1, img_2, *mc_imgs, target
+
+                return img_1, img_2, target
+
+        return img, target
+
+
+
+
 
 
 class TransCIFAR10(torchvision.datasets.CIFAR10):
