@@ -101,7 +101,23 @@ def init_data(
             image_folder=image_folder,
             training=training,
             copy_data=copy_data)
-
+    
+    elif dataset_name == 'ROV_fine_tune':
+        return _init_ROV_ft_data(
+            transform=transform,
+            init_transform=init_transform,
+            batch_size=s_batch_size,
+            stratify=False,
+            classes_per_batch=classes_per_batch,
+            unique_classes=unique_classes,
+            supervised_views=supervised_views,
+            world_size=world_size,
+            rank=rank,
+            root_path=root_path,
+            image_folder=image_folder,
+            training=training,
+            copy_data=copy_data)
+    
     elif dataset_name == 'imagenet_fine_tune':
         batch_size = s_batch_size
         return _init_imgnt_ft_data(
@@ -366,6 +382,7 @@ def _init_imgnt_data(
         transform=transform,
         train=training,
         copy_data=copy_data)
+    
     logger.info('ImageNet dataset created')
     unsupervised_set = TransImageNet(
         dataset=imagenet,
@@ -429,7 +446,7 @@ def _init_ROV_data(
     supervised_views=1,
     world_size=1,
     rank=0,
-    root_path='/datasets/',
+    root_path='/root/datasets/',
     image_folder='imagenet_full_size/061417/',
     training=True,
     copy_data=False,
@@ -489,13 +506,53 @@ def _init_ROV_data(
             tmp = ceil(len(unsupervised_loader) / len(supervised_loader))
             supervised_sampler.set_inner_epochs(tmp)
             logger.info(f'supervised-reset-period {tmp}')
-        logger.info('ROV supervised data loader created')
+        logger.info(f'ROV supervised data loader created of length {len(supervised_loader)}')
 
     return (unsupervised_loader, unsupervised_sampler,
             supervised_loader, supervised_sampler)
 
 
-
+def _init_ROV_ft_data(
+    transform,
+    init_transform,
+    batch_size,
+    stratify=False,
+    classes_per_batch=51,
+    unique_classes=False,
+    supervised_views=1,
+    world_size=1,
+    rank=0,
+    root_path='/datasets/',
+    image_folder='imagenet_full_size/061417/',
+    training=True,
+    copy_data=False,
+    drop_last=True,
+    tar_folder='imagenet_full_size/',
+    tar_file='imagenet_full_size-061417.tar',
+):
+    supervised_set = ROVDataset(
+        root=root_path,
+        image_folder=image_folder,
+        transform=transform,
+        train=training,
+        supervised=True,
+        supervised_views=supervised_views,
+        init_transform=init_transform,
+        seed=_GLOBAL_SEED)
+    logger.info('ROV fine-tune dataset created')
+    
+    dist_sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset=supervised_set,
+        num_replicas=world_size,
+        rank=rank)
+    data_loader = torch.utils.data.DataLoader(
+        supervised_set,
+        sampler=dist_sampler,
+        batch_size=batch_size,
+        pin_memory=True,
+        num_workers=8)
+    
+    return (data_loader, dist_sampler)
 
 
 def make_transforms(
@@ -550,7 +607,9 @@ def make_transforms(
         keep_file = None
         if subset_path is not None:
             if unlabeled_frac >= 0:
-                keep_file = os.path.join(subset_path, '10_percent_train_with_unknown_balanced.csv')
+                #keep_file = '/root/10_percent_train_with_unknown_balanced_aws.csv'
+                keep_file = '/root/datasets/crops_10percent_train_set_balanced.csv'
+                
             logger.info(f'keep file: {keep_file}')
 
         return _make_ROV_transforms(
@@ -823,11 +882,10 @@ def _make_ROV_transforms(
                 lines = csv.reader(rfile)
                 for line in lines:
                     #class_name = line.split('_')[0]
-                    target = line[1]
+                    target = int(line[1])
                     img = line[0]
-                    new_samples.append(
-                        (img,
-                         target))
+                    #new_samples.append((img,target))
+                    new_samples.append(('/root/datasets/all_crops/'+img,target))
                     new_targets.append(target)
         else:
             logger.info('flipping coin to keep labels')
@@ -984,7 +1042,7 @@ class ClassStratifiedSampler(torch.utils.data.Sampler):
         self.num_classes = len(data_source.classes)
         self.epochs = epochs
         self.outer_epoch = 0
-
+        
         if not self.unique_cpb:
             assert self.num_classes % self.cpb == 0
 
@@ -1038,6 +1096,7 @@ class ClassStratifiedSampler(torch.utils.data.Sampler):
             if len(t_indices) > 1:
                 t_indices = t_indices[torch.randperm(len(t_indices), generator=g)]
             samplers.append(iter(t_indices))
+            
         return samplers
 
     def _subsample_samplers(self, samplers):
@@ -1056,13 +1115,13 @@ class ClassStratifiedSampler(torch.utils.data.Sampler):
         # -- iterations per epoch (extract batch-size samples from each class)
         ipe = (self.num_classes // self.cpb if not self.unique_cpb
                else self.num_classes // (self.cpb * self.world_size)) * self.batch_size
-
+        
         for epoch in range(self.epochs):
 
             # -- shuffle class order
             samplers = self._get_local_samplers(epoch)
             subsampled_samplers = self._subsample_samplers(samplers)
-
+            
             counter, batch = 0, []
             for i in range(ipe):
                 batch += list(next(subsampled_samplers))
@@ -1234,39 +1293,46 @@ class ROVDataset(Dataset):
         global_mapping_idx = 0
 
         if train and supervised:
-            f = open('/home/tsharma/tarun_code/suncet/ROV_subsets/10_percent_train_with_unknown_balanced.csv', 'r')
+            #f = open('/root/10_percent_train_with_unknown_balanced_aws.csv', 'r')
+            f = open('/root/datasets/crops_10percent_train_set_balanced.csv', 'r')
             csv_reader = csv.reader(f, delimiter=',')
             for row in csv_reader:
-                self.samples.append([row[0], int(row[1])])
+                #self.samples.append([row[0], int(row[1])])
+                self.samples.append(['/root/datasets/all_crops/'+row[0], int(row[1])])
                 self.targets.append(int(row[1]))
             f.close()
                 
         elif supervised and not train:
             #### val
-            f = open('/home/tsharma/tarun_code/suncet/ROV_subsets/10_percent_train_with_unknown_balanced.csv', 'r') ### -> replace this by the val file (also balanced i guess)
+            #f = open('/root/5_percent_val_with_unknown_balanced_aws.csv', 'r') ### -> replace this by the val file (also balanced i guess)
+            f = open('/root/datasets/crops_5percent_val_set_balanced.csv', 'r')
             csv_reader = csv.reader(f, delimiter=',')
             for row in csv_reader:
-                self.samples.append([row[0], int(row[1])])
+                #self.samples.append([row[0], int(row[1])])
+                self.samples.append(['/root/datasets/all_crops/'+row[0], int(row[1])])
                 self.targets.append(int(row[1]))
             f.close()
             
         elif not supervised:
             #### unlabeled
-            f = open('/home/tsharma/tarun_code/75_percent_unlabeled_with_unknown.csv','r')
+            #f = open('/root/75_percent_unlabeled_with_unknown.csv','r')
+            f = open('/root/datasets/crops_75percent_unlabeled_set_yolo.csv', 'r')
             csv_reader = csv.reader(f, delimiter=',')
             for row in csv_reader:
-                self.samples.append([row[0], 999])  ## -> added dummy number 999 so as to not change structure of code       
+                #self.samples.append(['/root/all_ROV_crops_with_unknown/all_ROV_crops_with_unknown/'+row[0], 999])  ## -> added dummy number 999 so as to not change structure of code       
+                self.samples.append(['/root/datasets/all_crops/'+row[0], 999])
                 self.targets.append(999)
             f.close()
 
 
-        self.classes = np.unique(np.array(self.targets))
+        #self.classes = np.unique(np.array(self.targets))
 
         if self.supervised:
             self.targets, self.samples = init_transform(
                 self.samples,
                 seed)
-            logger.debug(f'num-labeled {len(self.samples)}')
+            
+            logger.info(f'$$$$$$$$$$$$$ num-labeled {len(self.samples)}')
             mint = None
             self.target_indices = []
 
@@ -1282,7 +1348,7 @@ class ROVDataset(Dataset):
                 
     @property
     def classes(self):
-        return self.classes
+        return np.unique(np.array(self.targets))
 
                 
     def __len__(self):
@@ -1296,10 +1362,10 @@ class ROVDataset(Dataset):
         
         target = self.targets[index]
         path = self.samples[index][0]
-        img = Image.open(image_path).convert('RGB')
+        img = Image.open(path).convert('RGB')
 
-        if self.target_transform is not None:
-            target = self.target_transform(target)
+        #if self.target_transform is not None:
+        #    target = self.target_transform(target)
 
         if self.transform is not None:
             if self.supervised:

@@ -45,7 +45,8 @@ from src.data_manager import (
 )
 from src.sgd import SGD
 from src.lars import LARS
-
+import sys
+sys.path.append('/root/apex')
 import apex
 from torch.nn.parallel import DistributedDataParallel
 
@@ -216,7 +217,8 @@ def main(args):
     iter_supervised = None
     ipe = len(unsupervised_loader)
     logger.info(f'iterations per epoch: {ipe}')
-
+    logger.info(f'length of supervised loader: {len(supervised_loader)}')
+    
     # -- init optimizer and scheduler
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
     encoder, optimizer, scheduler = init_opt(
@@ -261,16 +263,20 @@ def main(args):
         rloss_meter = AverageMeter()
         time_meter = AverageMeter()
         data_meter = AverageMeter()
-
+        
+        
         for itr, udata in enumerate(unsupervised_loader):
 
             def load_imgs():
                 # -- unsupervised imgs
                 uimgs = [u.to(device, non_blocking=True) for u in udata[:-1]]
+                 
                 # -- supervised imgs
                 global iter_supervised
-                try:
-                    sdata = next(iter_supervised)
+                #iter_supervised = iter(supervised_loader)
+                
+                try:                    
+                    sdata = next(iter_supervised)                    
                 except Exception:
                     iter_supervised = iter(supervised_loader)
                     logger.info(f'len.supervised_loader: {len(iter_supervised)}')
@@ -278,8 +284,10 @@ def main(args):
                 finally:
                     labels = torch.cat([labels_matrix for _ in range(supervised_views)])
                     simgs = [s.to(device, non_blocking=True) for s in sdata[:-1]]
+                    
                 # -- concatenate supervised imgs and unsupervised imgs
                 imgs = simgs + uimgs
+                
                 return imgs, labels
             (imgs, labels), dtime = gpu_timer(load_imgs)
             data_meter.update(dtime)

@@ -85,8 +85,8 @@ def process_main(rank, sel, fname, world_size, devices):
 
 if __name__ == '__main__':
     args = parser.parse_args()
-
     num_gpus = len(args.devices)
+    print(f' num gpus {num_gpus} devices: {args.devices}')
     mp.spawn(
         process_main,
         nprocs=num_gpus,
